@@ -54,8 +54,12 @@ gcsfs-agent-ops/
 ├── .gitignore                     # Ignores temp files, logs, and venvs
 │
 ├── skills/
-│   └── gcsfs-expert/
-│       └── SKILL.md               # Domain rules (fsspec contracts, GCS API, HNS, async tasks)
+│   ├── gcsfs-expert/
+│   │   └── SKILL.md               # Domain rules (fsspec contracts, GCS API, HNS, async tasks)
+│   ├── coding-standards/
+│   │   └── SKILL.md               # Python best practices (async, error handling, SOLID, performance)
+│   └── testing/
+│       └── SKILL.md               # Testing best practices (mock autospec, parametrization, fixtures)
 │
 ├── scanners/
 │   ├── ast_auditor.py             # AST scanner for fire-and-forget tasks, silent exceptions, etc.
