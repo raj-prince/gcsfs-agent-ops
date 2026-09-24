@@ -183,17 +183,26 @@ def apply_fix_and_submit_pr(
         run_cmd(["git", "checkout", "-B", branch_name], cwd=repo_path)
 
         # 4. Check if issue is async-create-task in core.py
-        # Read issue body for target file and line
         body = issue.get("body", "")
-        file_match = re.search(r"\*\*File\*\*:\s*`([^`]+)`", body)
-        line_match = re.search(r"\*\*Line\*\*:\s*`(\d+)`", body)
+        loc_match = re.search(r"\*\*Location\*\*:\s*`([^:]+):(\d+)`", body)
+        if loc_match:
+            target_rel_path = loc_match.group(1).strip()
+            target_line = int(loc_match.group(2))
+        else:
+            file_match = re.search(r"\*\*File\*\*:\s*`([^`]+)`", body)
+            line_match = re.search(r"\*\*Line\*\*:\s*`(\d+)`", body)
+            if file_match:
+                target_rel_path = file_match.group(1).strip()
+                target_line = int(line_match.group(1)) if line_match else 0
+            else:
+                title_match = re.search(r"in\s+([a-zA-Z0-9_\-/]+\.py):(\d+)", title)
+                if title_match:
+                    target_rel_path = title_match.group(1).strip()
+                    target_line = int(title_match.group(2))
+                else:
+                    logger.warning("Could not parse file from issue #%d body or title.", issue_num)
+                    return False
 
-        if not file_match:
-            logger.warning("Could not parse file from issue #%d body.", issue_num)
-            return False
-
-        target_rel_path = file_match.group(1)
-        target_line = int(line_match.group(1)) if line_match else 0
         target_file = Path(repo_path) / target_rel_path
 
         if not target_file.exists():
@@ -206,16 +215,12 @@ def apply_fix_and_submit_pr(
             with open(target_file, "r") as f:
                 lines = f.readlines()
 
-            # Ensure self._background_tasks exists in GCSFileSystem.__init__
-            has_bg_set = any("_background_tasks = set()" in l for l in lines)
-            if not has_bg_set:
+            # Ensure module-level _closing_tasks exists for close_session
+            has_tasks_set = any("_closing_tasks = set()" in l for l in lines)
+            if not has_tasks_set:
                 for idx, line in enumerate(lines):
-                    if "def __init__(" in line:
-                        # find end of __init__ or right after super().__init__
-                        for j in range(idx, min(idx + 50, len(lines))):
-                            if "super().__init__" in lines[j] or "self.project = project" in lines[j]:
-                                lines.insert(j + 1, "        self._background_tasks = set()\n")
-                                break
+                    if line.startswith("logger ="):
+                        lines.insert(idx + 1, "_closing_tasks = set()\n")
                         break
 
             # Find create_task at or near target_line
@@ -228,9 +233,8 @@ def apply_fix_and_submit_pr(
                     ind = " " * indent
                     raw_call = lines[idx].strip()
                     lines[idx] = f"{ind}_t = {raw_call}\n"
-                    lines.insert(idx + 1, f"{ind}if hasattr(self, '_background_tasks'):\n")
-                    lines.insert(idx + 2, f"{ind}    self._background_tasks.add(_t)\n")
-                    lines.insert(idx + 3, f"{ind}    _t.add_done_callback(self._background_tasks.discard)\n")
+                    lines.insert(idx + 1, f"{ind}_closing_tasks.add(_t)\n")
+                    lines.insert(idx + 2, f"{ind}_t.add_done_callback(_closing_tasks.discard)\n")
                     patched = True
                     break
 
@@ -241,9 +245,25 @@ def apply_fix_and_submit_pr(
             with open(target_file, "w") as f:
                 f.writelines(lines)
 
-        # 5. Run pytest verification
-        logger.info("Running pytest to verify changes...")
-        pytest_res = run_cmd(["pytest", "gcsfs/tests/test_core.py", "-k", "test_connect or test_init or test_simple", "-v"], cwd=repo_path, check=False)
+        # 5. Syntax check & Pytest verification
+        venv_py = Path(repo_path) / ".venv" / "bin" / "python3"
+        venv_pytest = Path(repo_path) / ".venv" / "bin" / "pytest"
+        py_bin = str(venv_py) if venv_py.exists() else sys.executable
+        pytest_bin = str(venv_pytest) if venv_pytest.exists() else "pytest"
+
+        logger.info("Verifying python syntax of %s with %s...", target_rel_path, py_bin)
+        compile_res = run_cmd([py_bin, "-m", "py_compile", str(target_file)], cwd=repo_path, check=False)
+        if compile_res.returncode != 0:
+            logger.error("Syntax check failed!\n%s", compile_res.stderr)
+            run_cmd([
+                "gh", "issue", "comment", str(issue_num),
+                "--repo", fork_slug,
+                "--body", f"❌ **Syntax Check Failed**:\n```\n{compile_res.stderr}\n```",
+            ], check=False)
+            return False
+
+        logger.info("Running pytest with %s...", pytest_bin)
+        pytest_res = run_cmd([pytest_bin, "gcsfs/tests/test_core.py", "-k", "test_connect or test_init", "-v"], cwd=repo_path, check=False)
         if pytest_res.returncode != 0:
             logger.error("Pytest failed!\n%s", pytest_res.stdout)
             run_cmd([
