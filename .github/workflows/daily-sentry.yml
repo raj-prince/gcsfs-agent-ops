@@ -1,0 +1,45 @@
+name: Daily Autonomous GCSFS Sentry
+
+on:
+  schedule:
+    - cron: '0 2 * * *'  # Runs every night at 2:00 AM UTC
+  workflow_dispatch:     # Allows manual trigger anytime from the Actions tab
+
+jobs:
+  sentry:
+    name: Audit & Raise Fix
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+
+    steps:
+      - name: Checkout Sentry Repo
+        uses: actions/checkout@v5
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+
+      - name: Install Dependencies
+        run: |
+          pip install -r requirements.txt
+
+      - name: Checkout Target gcsfs Repo
+        run: |
+          git clone https://github.com/fsspec/gcsfs.git target_gcsfs
+          cd target_gcsfs && pip install -e .
+
+      - name: Start Fake GCS Server Emulator
+        run: |
+          docker run -d -p 4443:4443 --name gcs_emulator fsouza/fake-gcs-server:latest -scheme http -public-host 0.0.0.0:4443
+          timeout 30s bash -c 'until curl -s http://localhost:4443/storage/v1/b; do sleep 1; done'
+
+      - name: Run Sentry Audit & Fix Loop
+        env:
+          STORAGE_EMULATOR_HOST: "http://localhost:4443"
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        run: |
+          python scripts/autonomous_sentry.py --repo target_gcsfs --target-slug fsspec/gcsfs
