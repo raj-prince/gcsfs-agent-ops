@@ -22,14 +22,19 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List, Optional
 
+DEFAULT_STATE_FILE = Path(__file__).resolve().parent.parent / "state" / "active_prs.json"
+LOG_FILE = Path(__file__).resolve().parent.parent / "state" / "daemon.log"
+LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[logging.StreamHandler(sys.stdout)],
+    handlers=[
+        logging.StreamHandler(sys.stdout),
+        logging.FileHandler(str(LOG_FILE)),
+    ],
 )
 logger = logging.getLogger("shepherd_daemon")
-
-DEFAULT_STATE_FILE = Path(__file__).resolve().parent.parent / "state" / "active_prs.json"
 
 
 def run_cmd(cmd: List[str], cwd: Optional[str] = None, check: bool = True) -> subprocess.CompletedProcess:
@@ -79,6 +84,14 @@ def is_issue_approved(issue: dict) -> bool:
     for comment in issue.get("comments", []):
         body = comment.get("body", "").strip().lower()
         if "/approve" in body or body == "approve":
+            return True
+    return False
+
+
+def is_issue_already_staged(issue: dict) -> bool:
+    for comment in issue.get("comments", []):
+        body = comment.get("body", "")
+        if "Staged PR Opened" in body:
             return True
     return False
 
@@ -253,61 +266,52 @@ def apply_fix_and_submit_pr(
             ], check=False)
             return False
 
-        # 6. Commit and Push
+        # 6. Commit and Push to fork
         commit_msg = f"fix(core): retain reference to background tasks ({title.split(':')[0] if ':' in title else title})\n\nAddresses {fork_slug}#{issue_num}"
         run_cmd(["git", "add", target_rel_path], cwd=repo_path)
         run_cmd(["git", "commit", "-m", commit_msg], cwd=repo_path)
         run_cmd(["git", "push", "-u", "origin", branch_name, "--force"], cwd=repo_path)
 
-        # 7. Open Upstream PR
+        # 7. Open Staged PR on Fork (raj-prince/gcsfs)
         pr_title = f"fix(core): retain reference to background tasks to prevent premature GC"
         pr_body = (
             f"### Problem\n\n"
-            f"As identified in proposal {fork_slug}#{issue_num}, `loop.create_task()` was called without "
+            f"As identified in proposal #{issue_num}, `loop.create_task()` was called without "
             f"retaining a strong reference, risking premature garbage collection and swallowed exceptions.\n\n"
             f"### Solution\n\n"
             f"- Retain a reference to the task in `self._background_tasks`.\n"
             f"- Add done callback to discard completed tasks.\n"
-            f"- Verified with unit tests.\n"
+            f"- Verified with unit tests.\n\n"
+            f"---\n"
+            f"> 💡 **Staged Fork Review**: This PR is currently staged on your fork `{fork_slug}` for review.\n"
+            f"> It has NOT been submitted upstream yet. When you are ready to publish it to `{upstream_slug}`, "
+            f"reply with **/promote** or **/publish** in this PR thread.\n"
         )
         pr_cmd = [
             "gh", "pr", "create",
-            "--repo", upstream_slug,
-            "--head", f"raj-prince:{branch_name}",
+            "--repo", fork_slug,
+            "--head", branch_name,
             "--base", "main",
             "--title", pr_title,
             "--body", pr_body,
         ]
         pr_res = run_cmd(pr_cmd, cwd=repo_path, check=False)
         if pr_res.returncode != 0:
-            logger.error("Failed to create PR: %s", pr_res.stderr)
+            logger.error("Failed to create staged PR on %s: %s", fork_slug, pr_res.stderr)
             return False
 
         pr_url = pr_res.stdout.strip()
         pr_number_match = re.search(r"/pull/(\d+)", pr_url)
         pr_number = int(pr_number_match.group(1)) if pr_number_match else 0
 
-        logger.info("Successfully opened Upstream PR: %s (#%d)", pr_url, pr_number)
+        logger.info("Successfully opened Staged PR on fork: %s (#%d)", pr_url, pr_number)
 
-        # 8. Record in state
-        state.setdefault("active_prs", []).append({
-            "pr_number": pr_number,
-            "pr_url": pr_url,
-            "branch": branch_name,
-            "title": pr_title,
-            "issue_number": issue_num,
-            "created_at": datetime.now(timezone.utc).isoformat(),
-            "last_checked_timestamp": datetime.now(timezone.utc).isoformat(),
-        })
-        save_state(state_file, state)
-
-        # 9. Close proposal issue on fork
+        # 8. Post status comment on proposal issue (KEEP ISSUE OPEN)
         run_cmd([
             "gh", "issue", "comment", str(issue_num),
             "--repo", fork_slug,
-            "--body", f"✅ **Fix Verified & Upstream PR Opened**: [{pr_title}]({pr_url})\n\nClosing proposal issue as active upstream tracking begins.",
+            "--body", f"✅ **Fix Verified & Staged PR Opened**: [{pr_title}]({pr_url})\n\nThis proposal will remain **OPEN** while you review the staged PR. When ready to open against upstream `{upstream_slug}`, comment **/promote** on the PR.",
         ], check=False)
-        run_cmd(["gh", "issue", "close", str(issue_num), "--repo", fork_slug], check=False)
 
         return True
 
@@ -317,6 +321,96 @@ def apply_fix_and_submit_pr(
     finally:
         # Return to main branch
         run_cmd(["git", "checkout", "main"], cwd=repo_path, check=False)
+
+
+def poll_staged_prs(fork_slug: str, upstream_slug: str, state: dict, state_file: Path, available_slots: int) -> int:
+    cmd = [
+        "gh", "pr", "list",
+        "--repo", fork_slug,
+        "--state", "open",
+        "--json", "number,title,headRefName,body,comments,url",
+    ]
+    res = run_cmd(cmd, check=False)
+    if res.returncode != 0:
+        return 0
+    try:
+        prs = json.loads(res.stdout)
+    except json.JSONDecodeError:
+        return 0
+
+    promoted_count = 0
+    for pr in prs:
+        if available_slots <= 0:
+            break
+        comments = pr.get("comments", [])
+        should_promote = any(
+            "/promote" in c.get("body", "").lower() or "/publish" in c.get("body", "").lower()
+            for c in comments
+        )
+        if should_promote:
+            pr_num = pr["number"]
+            branch_name = pr["headRefName"]
+            title = pr["title"]
+            body = pr.get("body", "")
+            # Extract originating proposal issue number
+            orig_match = re.search(r"proposal\s*#(\d+)", body, re.IGNORECASE)
+            orig_issue_num = int(orig_match.group(1)) if orig_match else None
+
+            # Remove staged notice from upstream PR body
+            cleaned_body = re.sub(r"---\s*> 💡 \*\*Staged Fork Review\*\*.*", "", body, flags=re.DOTALL).strip()
+            logger.info("Promoting staged PR #%d (%s) to upstream %s...", pr_num, branch_name, upstream_slug)
+
+            pr_cmd = [
+                "gh", "pr", "create",
+                "--repo", upstream_slug,
+                "--head", f"raj-prince:{branch_name}",
+                "--base", "main",
+                "--title", title,
+                "--body", cleaned_body,
+            ]
+            up_res = run_cmd(pr_cmd, check=False)
+            if up_res.returncode == 0:
+                up_url = up_res.stdout.strip()
+                up_match = re.search(r"/pull/(\d+)", up_url)
+                up_num = int(up_match.group(1)) if up_match else 0
+                logger.info("Successfully opened Upstream PR: %s (#%d)", up_url, up_num)
+
+                # Record in active pool
+                state.setdefault("active_prs", []).append({
+                    "pr_number": up_num,
+                    "pr_url": up_url,
+                    "branch": branch_name,
+                    "title": title,
+                    "fork_pr_number": pr_num,
+                    "issue_number": orig_issue_num,
+                    "created_at": datetime.now(timezone.utc).isoformat(),
+                    "last_checked_timestamp": datetime.now(timezone.utc).isoformat(),
+                })
+                save_state(state_file, state)
+
+                # Comment & close the staged fork PR
+                run_cmd([
+                    "gh", "pr", "comment", str(pr_num),
+                    "--repo", fork_slug,
+                    "--body", f"🚀 **Promoted to Upstream**: PR opened on upstream `{upstream_slug}`: [{title}]({up_url})\n\nClosing this staged PR on fork.",
+                ], check=False)
+                run_cmd(["gh", "pr", "close", str(pr_num), "--repo", fork_slug], check=False)
+
+                # Close the originating proposal issue
+                if orig_issue_num:
+                    run_cmd([
+                        "gh", "issue", "comment", str(orig_issue_num),
+                        "--repo", fork_slug,
+                        "--body", f"🚀 **Promoted to Upstream**: [{title}]({up_url})\n\nClosing proposal issue as active upstream tracking begins.",
+                    ], check=False)
+                    run_cmd(["gh", "issue", "close", str(orig_issue_num), "--repo", fork_slug], check=False)
+
+                promoted_count += 1
+                available_slots -= 1
+            else:
+                logger.error("Failed to promote PR to upstream: %s", up_res.stderr)
+
+    return promoted_count
 
 
 def main():
@@ -338,32 +432,32 @@ def main():
         try:
             state = load_state(state_path)
 
-            # 1. Poll existing PRs for merge / comments
+            # 1. Poll existing upstream PRs for merge / comments
             state_changed = poll_active_prs(state, args.upstream, args.repo)
             if state_changed:
                 save_state(state_path, state)
 
             current_count = len(state.get("active_prs", []))
             available_slots = args.max_prs - current_count
-            logger.info("Current Active PR Pool: %d/%d (Available slots: %d)", current_count, args.max_prs, available_slots)
+            logger.info("Current Active Upstream PR Pool: %d/%d (Available slots: %d)", current_count, args.max_prs, available_slots)
 
-            # 2. If slots available, check for approved proposals on fork
+            # 2. Check for staged PRs on fork waiting to be promoted upstream (/promote)
             if available_slots > 0:
-                open_proposals = get_open_proposals(args.fork)
-                for issue in open_proposals:
-                    if available_slots <= 0:
-                        break
-                    if is_issue_approved(issue):
-                        success = apply_fix_and_submit_pr(
-                            issue,
-                            repo_path=args.repo,
-                            upstream_slug=args.upstream,
-                            fork_slug=args.fork,
-                            state=state,
-                            state_file=state_path,
-                        )
-                        if success:
-                            available_slots -= 1
+                promoted = poll_staged_prs(args.fork, args.upstream, state, state_path, available_slots)
+                available_slots -= promoted
+
+            # 3. Check for approved proposals on fork (/approve) -> creates staged PR on fork
+            open_proposals = get_open_proposals(args.fork)
+            for issue in open_proposals:
+                if is_issue_approved(issue) and not is_issue_already_staged(issue):
+                    apply_fix_and_submit_pr(
+                        issue,
+                        repo_path=args.repo,
+                        upstream_slug=args.upstream,
+                        fork_slug=args.fork,
+                        state=state,
+                        state_file=state_path,
+                    )
 
             if args.once:
                 break
