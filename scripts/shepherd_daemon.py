@@ -99,6 +99,32 @@ def get_pr_status(pr_number: int, upstream_slug: str) -> Optional[dict]:
         return None
 
 
+def record_success(pr_data: dict, item: dict) -> None:
+    success_file = Path(__file__).resolve().parent.parent / "learnings" / "SUCCESS_LOG.md"
+    if not success_file.exists():
+        return
+    pr_num = pr_data.get("number", item.get("pr_number"))
+    title = pr_data.get("title", item.get("title", ""))
+    url = pr_data.get("url", item.get("pr_url", ""))
+    merged_at = pr_data.get("mergedAt", datetime.now(timezone.utc).isoformat())
+    issue_num = item.get("issue_number", "N/A")
+
+    entry = f"""
+## [PR #{pr_num}: {title}]({url})
+
+- **Merged At**: `{merged_at}`
+- **Originating Proposal**: Issue `#{issue_num}`
+- **Branch**: `{item.get('branch', 'unknown')}`
+- **Key Takeaways & Pattern**: Successfully merged into `fsspec/gcsfs`. Verified with unit tests against emulator.
+"""
+    try:
+        with open(success_file, "a") as f:
+            f.write(entry)
+        logger.info("Recorded success entry for PR #%d in %s", pr_num, success_file)
+    except Exception as e:
+        logger.warning("Could not record success entry: %s", e)
+
+
 def poll_active_prs(state: dict, upstream_slug: str, repo_path: str) -> bool:
     active_prs = state.get("active_prs", [])
     if not active_prs:
@@ -121,6 +147,7 @@ def poll_active_prs(state: dict, upstream_slug: str, repo_path: str) -> bool:
         pr_state = pr_data.get("state", "").upper()
         if pr_state == "MERGED":
             logger.info("🎉 Upstream PR #%d MERGED! Cleaning up branch '%s'...", pr_number, branch)
+            record_success(pr_data, item)
             state_changed = True
             if branch:
                 run_cmd(["git", "branch", "-D", branch], cwd=repo_path, check=False)

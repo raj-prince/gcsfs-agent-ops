@@ -11,6 +11,7 @@ Environment=PYTHONUNBUFFERED=1
 ExecStart=/usr/bin/python3 /home/princer_google_com/dev/gcsfs-agent-ops/scripts/shepherd_daemon.py --repo /home/princer_google_com/c2dev/gcsfs --upstream fsspec/gcsfs --fork raj-prince/gcsfs --max-prs 3 --poll-interval 1800
 Restart=always
 RestartSec=30
+RuntimeMaxSec=3h
 
 [Install]
 WantedBy=multi-user.target
