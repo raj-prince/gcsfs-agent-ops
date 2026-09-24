@@ -8,7 +8,7 @@ User=princer_google_com
 WorkingDirectory=/home/princer_google_com/dev/gcsfs-agent-ops
 Environment=PATH=/home/princer_google_com/.local/bin:/usr/local/bin:/usr/bin:/bin
 Environment=PYTHONUNBUFFERED=1
-ExecStart=/usr/bin/python3 /home/princer_google_com/dev/gcsfs-agent-ops/scripts/shepherd_daemon.py --repo /home/princer_google_com/c2dev/gcsfs --upstream fsspec/gcsfs --fork raj-prince/gcsfs --max-prs 3 --poll-interval 1800
+ExecStart=/usr/bin/python3 /home/princer_google_com/dev/gcsfs-agent-ops/scripts/shepherd_daemon.py --repo /home/princer_google_com/c2dev/gcsfs --upstream fsspec/gcsfs --fork raj-prince/gcsfs --max-prs 3 --poll-interval 120
 Restart=always
 RestartSec=30
 RuntimeMaxSec=3h

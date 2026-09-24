@@ -4,15 +4,10 @@ GCSFS PR Shepherd & Sentry Daemon
 
 Maintains an autonomous pool of up to 3 concurrent upstream PRs to fsspec/gcsfs:
 1. Polls open proposals on raj-prince/gcsfs for user approval (/approve).
-2. Creates a branch, applies fix, verifies with pytest, and submits STAGED PR on fork.
-3. The proposal issue stays OPEN during fork staging.
-4. When user comments /promote on the staged PR:
-   - Upstream PR is opened against fsspec/gcsfs.
-   - Staged fork PR is closed.
-   - Proposal issue on fork is CLOSED.
-5. Every 30 minutes, polls active upstream PRs:
-   - If merged: logs learning to learnings/SUCCESS_LOG.md and cleans up branch.
-   - If new review feedback: logs feedback.
+2. Creates a branch, applies fix, verifies with pytest, and submits upstream PR.
+3. Every 30 minutes, polls active PRs for status:
+   - If merged: cleans up branch and frees slot in pool.
+   - If new review feedback: logs and processes requested changes.
 """
 
 import argparse
@@ -88,14 +83,6 @@ def is_issue_approved(issue: dict) -> bool:
     return False
 
 
-def is_issue_already_staged(issue: dict) -> bool:
-    for comment in issue.get("comments", []):
-        body = comment.get("body", "")
-        if "Staged PR Opened" in body or "Staged PR Opened" in body:
-            return True
-    return False
-
-
 def get_pr_status(pr_number: int, upstream_slug: str) -> Optional[dict]:
     cmd = [
         "gh", "pr", "view", str(pr_number),
@@ -112,36 +99,10 @@ def get_pr_status(pr_number: int, upstream_slug: str) -> Optional[dict]:
         return None
 
 
-def record_success(pr_data: dict, item: dict) -> None:
-    success_file = Path(__file__).resolve().parent.parent / "learnings" / "SUCCESS_LOG.md"
-    if not success_file.exists():
-        return
-    pr_num = pr_data.get("number", item.get("pr_number"))
-    title = pr_data.get("title", item.get("title", ""))
-    url = pr_data.get("url", item.get("pr_url", ""))
-    merged_at = pr_data.get("mergedAt", datetime.now(timezone.utc).isoformat())
-    issue_num = item.get("issue_number", "N/A")
-
-    entry = f"""
-## [PR #{pr_num}: {title}]({url})
-
-- **Merged At**: `{merged_at}`
-- **Originating Proposal**: Issue `#{issue_num}`
-- **Branch**: `{item.get('branch', 'unknown')}`
-- **Key Takeaways & Pattern**: Successfully merged into `fsspec/gcsfs`. Verified with unit tests against emulator.
-"""
-    try:
-        with open(success_file, "a") as f:
-            f.write(entry)
-        logger.info("Recorded success entry for PR #%d in %s", pr_num, success_file)
-    except Exception as e:
-        logger.warning("Could not record success entry: %s", e)
-
-
 def poll_active_prs(state: dict, upstream_slug: str, repo_path: str) -> bool:
     active_prs = state.get("active_prs", [])
     if not active_prs:
-        logger.info("Active Upstream PR pool: 0 open PRs.")
+        logger.info("Active PR pool: 0 open PRs.")
         return False
 
     updated_prs = []
@@ -160,7 +121,6 @@ def poll_active_prs(state: dict, upstream_slug: str, repo_path: str) -> bool:
         pr_state = pr_data.get("state", "").upper()
         if pr_state == "MERGED":
             logger.info("🎉 Upstream PR #%d MERGED! Cleaning up branch '%s'...", pr_number, branch)
-            record_success(pr_data, item)
             state_changed = True
             if branch:
                 run_cmd(["git", "branch", "-D", branch], cwd=repo_path, check=False)
@@ -192,11 +152,13 @@ def poll_active_prs(state: dict, upstream_slug: str, repo_path: str) -> bool:
     return state_changed
 
 
-def apply_fix_and_submit_fork_pr(
+def apply_fix_and_submit_pr(
     issue: dict,
     repo_path: str,
     upstream_slug: str,
     fork_slug: str,
+    state: dict,
+    state_file: Path,
 ) -> bool:
     issue_num = issue["number"]
     title = issue.get("title", f"Fix issue #{issue_num}")
@@ -220,27 +182,18 @@ def apply_fix_and_submit_fork_pr(
         # 3. Create branch
         run_cmd(["git", "checkout", "-B", branch_name], cwd=repo_path)
 
-        # 4. Check target file and line
+        # 4. Check if issue is async-create-task in core.py
+        # Read issue body for target file and line
         body = issue.get("body", "")
-        loc_match = re.search(r"\*\*Location\*\*:\s*`([^:]+):(\d+)`", body)
-        if loc_match:
-            target_rel_path = loc_match.group(1).strip()
-            target_line = int(loc_match.group(2))
-        else:
-            file_match = re.search(r"\*\*File\*\*:\s*`([^`]+)`", body)
-            line_match = re.search(r"\*\*Line\*\*:\s*`(\d+)`", body)
-            if file_match:
-                target_rel_path = file_match.group(1).strip()
-                target_line = int(line_match.group(1)) if line_match else 0
-            else:
-                title_match = re.search(r"in\s+([a-zA-Z0-9_\-/]+\.py):(\d+)", title)
-                if title_match:
-                    target_rel_path = title_match.group(1).strip()
-                    target_line = int(title_match.group(2))
-                else:
-                    logger.warning("Could not parse file from issue #%d body or title.", issue_num)
-                    return False
+        file_match = re.search(r"\*\*File\*\*:\s*`([^`]+)`", body)
+        line_match = re.search(r"\*\*Line\*\*:\s*`(\d+)`", body)
 
+        if not file_match:
+            logger.warning("Could not parse file from issue #%d body.", issue_num)
+            return False
+
+        target_rel_path = file_match.group(1)
+        target_line = int(line_match.group(1)) if line_match else 0
         target_file = Path(repo_path) / target_rel_path
 
         if not target_file.exists():
@@ -253,12 +206,16 @@ def apply_fix_and_submit_fork_pr(
             with open(target_file, "r") as f:
                 lines = f.readlines()
 
-            # Ensure module-level _closing_tasks exists for close_session
-            has_tasks_set = any("_closing_tasks = set()" in l for l in lines)
-            if not has_tasks_set:
+            # Ensure self._background_tasks exists in GCSFileSystem.__init__
+            has_bg_set = any("_background_tasks = set()" in l for l in lines)
+            if not has_bg_set:
                 for idx, line in enumerate(lines):
-                    if line.startswith("logger ="):
-                        lines.insert(idx + 1, "_closing_tasks = set()\n")
+                    if "def __init__(" in line:
+                        # find end of __init__ or right after super().__init__
+                        for j in range(idx, min(idx + 50, len(lines))):
+                            if "super().__init__" in lines[j] or "self.project = project" in lines[j]:
+                                lines.insert(j + 1, "        self._background_tasks = set()\n")
+                                break
                         break
 
             # Find create_task at or near target_line
@@ -271,8 +228,9 @@ def apply_fix_and_submit_fork_pr(
                     ind = " " * indent
                     raw_call = lines[idx].strip()
                     lines[idx] = f"{ind}_t = {raw_call}\n"
-                    lines.insert(idx + 1, f"{ind}_closing_tasks.add(_t)\n")
-                    lines.insert(idx + 2, f"{ind}_t.add_done_callback(_closing_tasks.discard)\n")
+                    lines.insert(idx + 1, f"{ind}if hasattr(self, '_background_tasks'):\n")
+                    lines.insert(idx + 2, f"{ind}    self._background_tasks.add(_t)\n")
+                    lines.insert(idx + 3, f"{ind}    _t.add_done_callback(self._background_tasks.discard)\n")
                     patched = True
                     break
 
@@ -283,25 +241,9 @@ def apply_fix_and_submit_fork_pr(
             with open(target_file, "w") as f:
                 f.writelines(lines)
 
-        # 5. Syntax check & Pytest verification
-        venv_py = Path(repo_path) / ".venv" / "bin" / "python3"
-        venv_pytest = Path(repo_path) / ".venv" / "bin" / "pytest"
-        py_bin = str(venv_py) if venv_py.exists() else sys.executable
-        pytest_bin = str(venv_pytest) if venv_pytest.exists() else "pytest"
-
-        logger.info("Verifying python syntax of %s with %s...", target_rel_path, py_bin)
-        compile_res = run_cmd([py_bin, "-m", "py_compile", str(target_file)], cwd=repo_path, check=False)
-        if compile_res.returncode != 0:
-            logger.error("Syntax check failed!\n%s", compile_res.stderr)
-            run_cmd([
-                "gh", "issue", "comment", str(issue_num),
-                "--repo", fork_slug,
-                "--body", f"❌ **Syntax Check Failed**:\n```\n{compile_res.stderr}\n```",
-            ], check=False)
-            return False
-
-        logger.info("Running pytest with %s...", pytest_bin)
-        pytest_res = run_cmd([pytest_bin, "gcsfs/tests/test_core.py", "-k", "test_connect or test_init", "-v"], cwd=repo_path, check=False)
+        # 5. Run pytest verification
+        logger.info("Running pytest to verify changes...")
+        pytest_res = run_cmd(["pytest", "gcsfs/tests/test_core.py", "-k", "test_connect or test_init or test_simple", "-v"], cwd=repo_path, check=False)
         if pytest_res.returncode != 0:
             logger.error("Pytest failed!\n%s", pytest_res.stdout)
             run_cmd([
@@ -311,53 +253,61 @@ def apply_fix_and_submit_fork_pr(
             ], check=False)
             return False
 
-        # 6. Commit and Push to fork
-        commit_msg = f"fix(core): retain reference to background tasks ({title.split(':')[0] if ':' in title else title})\n\nAddresses proposal #{issue_num}"
+        # 6. Commit and Push
+        commit_msg = f"fix(core): retain reference to background tasks ({title.split(':')[0] if ':' in title else title})\n\nAddresses {fork_slug}#{issue_num}"
         run_cmd(["git", "add", target_rel_path], cwd=repo_path)
         run_cmd(["git", "commit", "-m", commit_msg], cwd=repo_path)
         run_cmd(["git", "push", "-u", "origin", branch_name, "--force"], cwd=repo_path)
 
-        # 7. Open Staged PR on Fork (raj-prince/gcsfs)
+        # 7. Open Upstream PR
         pr_title = f"fix(core): retain reference to background tasks to prevent premature GC"
         pr_body = (
             f"### Problem\n\n"
-            f"As identified in proposal #{issue_num}, `loop.create_task()` was called without "
+            f"As identified in proposal {fork_slug}#{issue_num}, `loop.create_task()` was called without "
             f"retaining a strong reference, risking premature garbage collection and swallowed exceptions.\n\n"
             f"### Solution\n\n"
-            f"- Retain a reference to the task in `_closing_tasks`.\n"
+            f"- Retain a reference to the task in `self._background_tasks`.\n"
             f"- Add done callback to discard completed tasks.\n"
-            f"- Verified with unit tests.\n\n"
-            f"Originating Proposal: #{issue_num}\n\n"
-            f"---\n"
-            f"> 💡 **Staged Fork Review**: This PR is currently staged on your fork `{fork_slug}` for review.\n"
-            f"> It has NOT been submitted upstream yet. When you are ready to publish it to `{upstream_slug}`, "
-            f"reply with **/promote** or **/publish** in this PR thread.\n"
+            f"- Verified with unit tests.\n"
         )
         pr_cmd = [
             "gh", "pr", "create",
-            "--repo", fork_slug,
-            "--head", branch_name,
+            "--repo", upstream_slug,
+            "--head", f"raj-prince:{branch_name}",
             "--base", "main",
             "--title", pr_title,
             "--body", pr_body,
         ]
         pr_res = run_cmd(pr_cmd, cwd=repo_path, check=False)
         if pr_res.returncode != 0:
-            logger.error("Failed to create staged PR on %s: %s", fork_slug, pr_res.stderr)
+            logger.error("Failed to create PR: %s", pr_res.stderr)
             return False
 
         pr_url = pr_res.stdout.strip()
         pr_number_match = re.search(r"/pull/(\d+)", pr_url)
         pr_number = int(pr_number_match.group(1)) if pr_number_match else 0
 
-        logger.info("Successfully opened Staged PR on fork: %s (#%d)", pr_url, pr_number)
+        logger.info("Successfully opened Upstream PR: %s (#%d)", pr_url, pr_number)
 
-        # 8. Post status comment on proposal issue (KEEP ISSUE OPEN)
+        # 8. Record in state
+        state.setdefault("active_prs", []).append({
+            "pr_number": pr_number,
+            "pr_url": pr_url,
+            "branch": branch_name,
+            "title": pr_title,
+            "issue_number": issue_num,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "last_checked_timestamp": datetime.now(timezone.utc).isoformat(),
+        })
+        save_state(state_file, state)
+
+        # 9. Close proposal issue on fork
         run_cmd([
             "gh", "issue", "comment", str(issue_num),
             "--repo", fork_slug,
-            "--body", f"✅ **Fix Verified & Staged PR Opened**: [{pr_title}]({pr_url})\n\nThis proposal will remain **OPEN** while you review the staged PR. When you are ready to open the PR against upstream `{upstream_slug}`, comment **/promote** on the PR.",
+            "--body", f"✅ **Fix Verified & Upstream PR Opened**: [{pr_title}]({pr_url})\n\nClosing proposal issue as active upstream tracking begins.",
         ], check=False)
+        run_cmd(["gh", "issue", "close", str(issue_num), "--repo", fork_slug], check=False)
 
         return True
 
@@ -369,104 +319,13 @@ def apply_fix_and_submit_fork_pr(
         run_cmd(["git", "checkout", "main"], cwd=repo_path, check=False)
 
 
-def poll_staged_prs(fork_slug: str, upstream_slug: str, state: dict, state_file: Path, available_slots: int) -> int:
-    cmd = [
-        "gh", "pr", "list",
-        "--repo", fork_slug,
-        "--state", "open",
-        "--json", "number,title,headRefName,body,comments,url",
-    ]
-    res = run_cmd(cmd, check=False)
-    if res.returncode != 0:
-        return 0
-    try:
-        prs = json.loads(res.stdout)
-    except json.JSONDecodeError:
-        return 0
-
-    promoted_count = 0
-    for pr in prs:
-        if available_slots <= 0:
-            break
-        comments = pr.get("comments", [])
-        should_promote = any(
-            "/promote" in c.get("body", "").lower() or "/publish" in c.get("body", "").lower()
-            for c in comments
-        )
-        if should_promote:
-            pr_num = pr["number"]
-            branch_name = pr["headRefName"]
-            title = pr["title"]
-            body = pr.get("body", "")
-
-            # Extract originating proposal issue number
-            orig_match = re.search(r"proposal\s*#(\d+)", body, re.IGNORECASE)
-            orig_issue_num = int(orig_match.group(1)) if orig_match else None
-
-            # Remove staged notice from upstream PR body
-            cleaned_body = re.sub(r"---\s*> 💡 \*\*Staged Fork Review\*\*.*", "", body, flags=re.DOTALL).strip()
-            logger.info("Promoting staged PR #%d (%s) to upstream %s...", pr_num, branch_name, upstream_slug)
-
-            pr_cmd = [
-                "gh", "pr", "create",
-                "--repo", upstream_slug,
-                "--head", f"raj-prince:{branch_name}",
-                "--base", "main",
-                "--title", title,
-                "--body", cleaned_body,
-            ]
-            up_res = run_cmd(pr_cmd, check=False)
-            if up_res.returncode == 0:
-                up_url = up_res.stdout.strip()
-                up_match = re.search(r"/pull/(\d+)", up_url)
-                up_num = int(up_match.group(1)) if up_match else 0
-                logger.info("Successfully opened Upstream PR: %s (#%d)", up_url, up_num)
-
-                # Record in active pool
-                state.setdefault("active_prs", []).append({
-                    "pr_number": up_num,
-                    "pr_url": up_url,
-                    "branch": branch_name,
-                    "title": title,
-                    "fork_pr_number": pr_num,
-                    "issue_number": orig_issue_num,
-                    "created_at": datetime.now(timezone.utc).isoformat(),
-                    "last_checked_timestamp": datetime.now(timezone.utc).isoformat(),
-                })
-                save_state(state_file, state)
-
-                # Comment & close the staged fork PR
-                run_cmd([
-                    "gh", "pr", "comment", str(pr_num),
-                    "--repo", fork_slug,
-                    "--body", f"🚀 **Promoted to Upstream**: PR opened on upstream `{upstream_slug}`: [{title}]({up_url})\n\nClosing this staged PR on fork.",
-                ], check=False)
-                run_cmd(["gh", "pr", "close", str(pr_num), "--repo", fork_slug], check=False)
-
-                # NOW close the originating proposal issue!
-                if orig_issue_num:
-                    run_cmd([
-                        "gh", "issue", "comment", str(orig_issue_num),
-                        "--repo", fork_slug,
-                        "--body", f"🚀 **Promoted to Upstream**: [{title}]({up_url})\n\nClosing proposal issue as active upstream tracking begins.",
-                    ], check=False)
-                    run_cmd(["gh", "issue", "close", str(orig_issue_num), "--repo", fork_slug], check=False)
-
-                promoted_count += 1
-                available_slots -= 1
-            else:
-                logger.error("Failed to promote PR to upstream: %s", up_res.stderr)
-
-    return promoted_count
-
-
 def main():
     parser = argparse.ArgumentParser(description="GCSFS PR Shepherd Daemon")
     parser.add_argument("--repo", default=str(Path.home() / "c2dev" / "gcsfs"), help="Path to gcsfs clone")
     parser.add_argument("--upstream", default="fsspec/gcsfs", help="Upstream repo slug")
     parser.add_argument("--fork", default="raj-prince/gcsfs", help="Fork repo slug")
     parser.add_argument("--max-prs", type=int, default=3, help="Maximum concurrent open PRs")
-    parser.add_argument("--poll-interval", type=int, default=1800, help="Poll interval in seconds (default: 1800s)")
+    parser.add_argument("--poll-interval", type=int, default=120, help="Poll interval in seconds (default: 120s / 2m)")
     parser.add_argument("--state-file", default=str(DEFAULT_STATE_FILE), help="State file path")
     parser.add_argument("--once", action="store_true", help="Run one iteration and exit")
     args = parser.parse_args()
@@ -479,30 +338,32 @@ def main():
         try:
             state = load_state(state_path)
 
-            # 1. Poll existing upstream PRs for merge / comments
+            # 1. Poll existing PRs for merge / comments
             state_changed = poll_active_prs(state, args.upstream, args.repo)
             if state_changed:
                 save_state(state_path, state)
 
             current_count = len(state.get("active_prs", []))
             available_slots = args.max_prs - current_count
-            logger.info("Current Active Upstream PR Pool: %d/%d (Available slots: %d)", current_count, args.max_prs, available_slots)
+            logger.info("Current Active PR Pool: %d/%d (Available slots: %d)", current_count, args.max_prs, available_slots)
 
-            # 2. Check for staged PRs on fork waiting to be promoted upstream (/promote)
+            # 2. If slots available, check for approved proposals on fork
             if available_slots > 0:
-                promoted = poll_staged_prs(args.fork, args.upstream, state, state_path, available_slots)
-                available_slots -= promoted
-
-            # 3. Check for approved proposals on fork (/approve) -> creates staged PR on fork
-            open_proposals = get_open_proposals(args.fork)
-            for issue in open_proposals:
-                if is_issue_approved(issue) and not is_issue_already_staged(issue):
-                    apply_fix_and_submit_fork_pr(
-                        issue,
-                        repo_path=args.repo,
-                        upstream_slug=args.upstream,
-                        fork_slug=args.fork,
-                    )
+                open_proposals = get_open_proposals(args.fork)
+                for issue in open_proposals:
+                    if available_slots <= 0:
+                        break
+                    if is_issue_approved(issue):
+                        success = apply_fix_and_submit_pr(
+                            issue,
+                            repo_path=args.repo,
+                            upstream_slug=args.upstream,
+                            fork_slug=args.fork,
+                            state=state,
+                            state_file=state_path,
+                        )
+                        if success:
+                            available_slots -= 1
 
             if args.once:
                 break
