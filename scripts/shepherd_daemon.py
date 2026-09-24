@@ -1,19 +1,20 @@
 #!/usr/bin/env python3
-"""Autonomous PR Shepherd Daemon for gcsfs.
+"""Autonomous PR Shepherd Daemon with Fork Proposal Approvals.
 
-Maintains up to 3 active PRs concurrently:
-1. Polls each active PR every 30 minutes.
-   - If MERGED: Cleans up branch, frees slot.
+Workflow:
+1. Polls active upstream PRs (fsspec/gcsfs) every 30 minutes (Max 3 concurrent PRs):
+   - If MERGED: Cleans up branch, frees slot, skips!
    - If CLOSED: Cleans up branch, frees slot.
-   - If OPEN: Inspects for new review comments.
-     * Generates fix for reviewer feedback.
-     * Verifies with pytest.
-     * Pushes commit and replies to the review thread.
+   - If OPEN: Inspects for reviewer comments, addresses them with tests, pushes updates.
 2. If active PR count < 3:
-   - Scans gcsfs codebase for top priority issues.
-   - Implements fix on a feature branch.
-   - Verifies against GCS emulator.
-   - Creates a new PR and adds it to the active pool.
+   - Polls forked repository (raj-prince/gcsfs) for open proposal issues.
+   - Checks if the owner commented `/approve` or `approve` on any proposal.
+   - For approved proposals:
+     * Branches, implements fix with gcsfs-expert agent.
+     * Verifies with pytest against emulator.
+     * Pushes to fork and opens upstream PR on fsspec/gcsfs.
+     * Comments on and closes the proposal issue in the fork.
+     * Tracks the new upstream PR in the 3-PR active pool.
 """
 
 from __future__ import annotations
@@ -22,18 +23,15 @@ import argparse
 import datetime
 import json
 import os
+import re
 import subprocess
 import sys
 import time
 from pathlib import Path
 from typing import Any
 
-# Add project root to sys.path
 BASE_DIR = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(BASE_DIR))
-
-from scanners.ast_auditor import CodebaseAuditor
-from scanners.test_auditor import TestAuditor
 
 STATE_FILE = BASE_DIR / "state" / "active_prs.json"
 
@@ -67,7 +65,7 @@ def get_current_github_user() -> str:
     res = run_command(["gh", "api", "user", "--jq", ".login"], check=False)
     if res.returncode == 0 and res.stdout.strip():
         return res.stdout.strip()
-    return ""
+    return "raj-prince"
 
 
 def get_pr_details(repo_slug: str, pr_number: int) -> dict[str, Any] | None:
@@ -82,7 +80,6 @@ def get_pr_details(repo_slug: str, pr_number: int) -> dict[str, Any] | None:
 
 
 def get_inline_review_comments(repo_slug: str, pr_number: int) -> list[dict[str, Any]]:
-    """Fetches line-level review comments using GitHub API."""
     res = run_command(
         ["gh", "api", f"/repos/{repo_slug}/pulls/{pr_number}/comments"],
         check=False
@@ -98,16 +95,13 @@ def handle_pr_feedback(
     pr_data: dict[str, Any],
     new_feedback: list[dict[str, Any]]
 ) -> bool:
-    """Invokes agent to address review comments, runs pytest, and pushes update."""
     branch = pr_data["headRefName"]
     pr_num = pr_data["number"]
     log(f"Addressing {len(new_feedback)} feedback comment(s) on PR #{pr_num} ({branch})...")
 
-    # 1. Switch to branch and pull latest
     run_command(["git", "checkout", branch], cwd=str(repo_path))
     run_command(["git", "pull", "--ff-only"], cwd=str(repo_path), check=False)
 
-    # 2. Format feedback for the agent
     feedback_text = "\n\n".join([
         f"Reviewer @{c.get('user', {}).get('login', 'unknown')} on {c.get('path', 'general')}:{c.get('line', '')}:\n{c.get('body', '')}"
         for c in new_feedback
@@ -123,132 +117,141 @@ def handle_pr_feedback(
     log(f"Invoking gcsfs-expert agent for PR #{pr_num}...")
     run_command(["agy", "-p", prompt], cwd=str(repo_path), check=False)
 
-    # 3. Check if changes were produced
     diff = run_command(["git", "status", "--porcelain"], cwd=str(repo_path))
     if not diff.stdout.strip():
-        log(f"No code changes required for PR #{pr_num} (feedback may have been informational).")
+        log(f"No code changes required for PR #{pr_num}.")
         return True
 
-    # 4. Verify with Pytest
     log(f"Verifying updated code with pytest for PR #{pr_num}...")
     test_res = run_command(["pytest", "gcsfs/tests/test_core.py", "-q", "--maxfail=1"], cwd=str(repo_path), check=False)
     if test_res.returncode != 0:
-        log(f"Pytest failed after applying feedback on PR #{pr_num}. Reverting changes to keep branch clean.")
+        log(f"Pytest failed after applying feedback on PR #{pr_num}. Reverting changes.")
         run_command(["git", "checkout", "."], cwd=str(repo_path))
         return False
 
-    # 5. Commit and push
     commit_msg = f"chore: address PR #{pr_num} review feedback"
     run_command(["git", "commit", "-am", commit_msg], cwd=str(repo_path))
     run_command(["git", "push", "origin", branch], cwd=str(repo_path))
 
-    # 6. Post reply on PR
-    reply_body = (
-        f"### Automated Shepherd Update\n\n"
-        f"Addressed review feedback in branch `{branch}`. All pytest checks passed."
-    )
+    reply_body = f"### Automated Shepherd Update\n\nAddressed review feedback in branch `{branch}`. All pytest checks passed."
     run_command(["gh", "pr", "comment", str(pr_num), "--repo", repo_slug, "--body", reply_body], check=False)
     log(f"Pushed update and posted reply on PR #{pr_num}.")
     return True
 
 
-def create_new_pr_task(
+def find_approved_proposals_in_fork(fork_slug: str, owner_user: str) -> list[dict[str, Any]]:
+    """Checks fork issues for approval comments from owner."""
+    res = run_command(
+        ["gh", "issue", "list", "--repo", fork_slug, "--state", "open", "--json", "number,title,body,comments"],
+        check=False
+    )
+    if res.returncode != 0:
+        return []
+
+    issues = json.loads(res.stdout)
+    approved = []
+    approval_pattern = re.compile(r"\b(/approve|approve|lgtm|go ahead)\b", re.IGNORECASE)
+
+    for issue in issues:
+        comments = issue.get("comments", [])
+        for c in comments:
+            author = c.get("author", {}).get("login")
+            body = c.get("body", "")
+            if author == owner_user and approval_pattern.search(body):
+                approved.append(issue)
+                break
+    return approved
+
+
+def process_approved_proposal(
     repo_path: Path,
-    repo_slug: str,
-    active_prs: list[dict[str, Any]]
+    upstream_slug: str,
+    fork_slug: str,
+    issue: dict[str, Any]
 ) -> dict[str, Any] | None:
-    """Finds top issue, creates branch, writes fix, verifies, and raises PR."""
-    log("Scanning codebase for top-priority candidate issue...")
+    issue_num = issue["number"]
+    title = issue["title"]
+    body = issue["body"]
+    log(f"Processing approved proposal #{issue_num}: '{title}'...")
+
+    # Post initial acknowledgement
+    run_command([
+        "gh", "issue", "comment", str(issue_num),
+        "--repo", fork_slug,
+        "--body", "🚀 **Approval received!** The gcsfs-expert daemon is creating a branch, implementing the fix, and running tests..."
+    ], check=False)
+
     run_command(["git", "checkout", "main"], cwd=str(repo_path))
     run_command(["git", "pull", "--ff-only"], cwd=str(repo_path), check=False)
 
-    source_auditor = CodebaseAuditor(root_dir=str(repo_path))
-    test_auditor = TestAuditor(tests_dir=str(repo_path / "gcsfs" / "tests"))
-    findings = source_auditor.audit() + test_auditor.audit()
-
-    # Avoid rules already being tackled in active PRs
-    active_rules = {p.get("rule") for p in active_prs}
-
-    severity_order = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3}
-    sorted_findings = sorted(findings, key=lambda x: severity_order.get(x.get("severity", "LOW"), 99))
-
-    candidate = None
-    for f in sorted_findings:
-        if f["rule"] not in active_rules:
-            candidate = f
-            break
-
-    if not candidate:
-        log("No new eligible candidate issues found.")
-        return None
-
-    log(f"Selected candidate: {candidate['id']} ({candidate['rule']}) at {candidate['file']}:{candidate['line']}")
-
-    # Create feature branch
-    branch_name = f"bot/{candidate['rule']}-L{candidate['line']}"
+    branch_name = f"bot/proposal-{issue_num}"
     run_command(["git", "checkout", "-B", branch_name], cwd=str(repo_path))
 
-    # Agent writes fix
     skill_file = BASE_DIR / "skills" / "gcsfs-expert" / "SKILL.md"
     prompt = (
-        f"Follow the rules in {skill_file}. In {repo_path}, fix issue {candidate['id']} in {candidate['file']}:{candidate['line']}. "
-        f"Issue: {candidate['summary']}. Suggestion: {candidate['suggestion']}. "
-        "Keep the fix minimal and backward-compatible."
+        f"Follow the rules in {skill_file}. In workspace {repo_path}, implement the fix for proposal #{issue_num}:\n\n"
+        f"Title: {title}\nDetails: {body}\n\n"
+        "Ensure the fix is minimal, safe, and backwards-compatible with fsspec."
     )
-    log("Invoking agent to implement fix...")
+    log(f"Invoking gcsfs-expert agent to fix proposal #{issue_num}...")
     run_command(["agy", "-p", prompt], cwd=str(repo_path), check=False)
 
-    # Check diff
     diff = run_command(["git", "status", "--porcelain"], cwd=str(repo_path))
     if not diff.stdout.strip():
-        log("Agent did not produce changes. Aborting new PR.")
+        log(f"Agent did not generate changes for proposal #{issue_num}.")
+        run_command(["gh", "issue", "comment", str(issue_num), "--repo", fork_slug, "--body", "⚠️ Agent could not generate a valid diff. Leaving issue open."], check=False)
         run_command(["git", "checkout", "main"], cwd=str(repo_path))
         return None
 
-    # Verify with Pytest
-    log("Verifying fix with pytest...")
+    log("Running pytest verification against GCS emulator...")
     test_res = run_command(["pytest", "gcsfs/tests/test_core.py", "-q", "--maxfail=1"], cwd=str(repo_path), check=False)
     if test_res.returncode != 0:
-        log("Pytest failed for candidate fix. Discarding branch.")
+        log(f"Pytest failed for proposal #{issue_num}. Discarding.")
         run_command(["git", "checkout", "."], cwd=str(repo_path))
         run_command(["git", "checkout", "main"], cwd=str(repo_path))
+        run_command(["gh", "issue", "comment", str(issue_num), "--repo", fork_slug, "--body", "❌ Tests failed against emulator. Aborting PR creation."], check=False)
         return None
 
-    # Commit, push, and open PR
-    commit_msg = f"fix({Path(candidate['file']).stem}): {candidate['summary']}"
+    # Commit and push to fork
+    commit_msg = f"fix: {title.replace('[Proposal] ', '')}"
     run_command(["git", "commit", "-am", commit_msg], cwd=str(repo_path))
     run_command(["git", "push", "origin", branch_name, "--force"], cwd=str(repo_path))
 
+    # Open PR on upstream fsspec/gcsfs
+    fork_user = fork_slug.split("/")[0]
+    pr_head = f"{fork_user}:{branch_name}"
     pr_body = (
-        f"## Automated Fix by `gcsfs-expert` Sentry\n\n"
-        f"**Rule**: `{candidate['rule']}` ({candidate['severity']})\n"
-        f"**File**: `{candidate['file']}:{candidate['line']}`\n\n"
-        f"### Summary\n{candidate['summary']}\n\n"
-        f"### Rationale\n{candidate['suggestion']}\n\n"
-        f"### Verification\n- Ran pytest against local GCS emulator: **PASSED**."
+        f"## Automated Fix for Proposal #{issue_num}\n\n"
+        f"{body}\n\n"
+        f"### Verification\n- Tested against local GCS emulator: **PASSED**."
     )
 
+    log(f"Submitting PR to {upstream_slug} with head {pr_head}...")
     pr_res = run_command([
         "gh", "pr", "create",
-        "--repo", repo_slug,
+        "--repo", upstream_slug,
         "--title", commit_msg,
         "--body", pr_body,
-        "--head", branch_name,
+        "--head", pr_head,
         "--base", "main"
     ], cwd=str(repo_path), check=False)
 
     if pr_res.returncode != 0:
-        log(f"gh pr create failed: {pr_res.stderr}")
+        log(f"Failed to create PR: {pr_res.stderr}")
         return None
 
     pr_url = pr_res.stdout.strip()
-    pr_number = int(pr_url.split("/")[-1])
-    log(f"Successfully opened PR #{pr_number}: {pr_url}")
+    upstream_pr_num = int(pr_url.split("/")[-1])
+    log(f"🎉 Successfully created upstream PR #{upstream_pr_num}: {pr_url}")
+
+    # Close proposal issue in fork
+    close_msg = f"✅ Upstream Pull Request created: {pr_url}\nClosing this proposal."
+    run_command(["gh", "issue", "close", str(issue_num), "--repo", fork_slug, "--comment", close_msg], check=False)
 
     return {
-        "pr_number": pr_number,
+        "pr_number": upstream_pr_num,
         "branch": branch_name,
-        "rule": candidate["rule"],
+        "rule": title,
         "opened_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
         "last_checked_at": datetime.datetime.now(datetime.timezone.utc).isoformat()
     }
@@ -256,52 +259,52 @@ def create_new_pr_task(
 
 def run_shepherd_loop(
     target_repo_path: str,
-    repo_slug: str,
+    upstream_slug: str,
+    fork_slug: str,
     max_prs: int = 3,
     poll_interval_seconds: int = 1800
 ) -> None:
     repo_path = Path(target_repo_path).resolve()
     current_user = get_current_github_user()
-    log(f"Starting GCSFS Shepherd Daemon (Target: {repo_slug}, Max PRs: {max_prs}, Interval: {poll_interval_seconds}s)")
+    log(f"Starting GCSFS Shepherd (Upstream: {upstream_slug}, Fork: {fork_slug}, Max PRs: {max_prs}, Interval: {poll_interval_seconds}s)")
 
     while True:
         state = load_state()
         active_prs = state.get("active_prs", [])
-        log(f"--- Shepherd Cycle Starting. Currently tracking {len(active_prs)}/{max_prs} active PRs ---")
+        log(f"--- Cycle Starting. Tracking {len(active_prs)}/{max_prs} active upstream PRs ---")
 
         updated_active_prs = []
 
-        # 1. Poll each active PR
+        # 1. Poll each active upstream PR on fsspec/gcsfs
         for pr_entry in active_prs:
             pr_num = pr_entry["pr_number"]
             branch = pr_entry["branch"]
             last_checked = pr_entry.get("last_checked_at", "1970-01-01T00:00:00Z")
 
-            pr_data = get_pr_details(repo_slug, pr_num)
+            pr_data = get_pr_details(upstream_slug, pr_num)
             if not pr_data:
-                log(f"Could not fetch details for PR #{pr_num}. Retaining in tracking.")
                 updated_active_prs.append(pr_entry)
                 continue
 
             state_str = pr_data.get("state", "OPEN")
             merged_at = pr_data.get("mergedAt")
 
-            # Condition A: Merged
+            # Condition A: Merged!
             if merged_at or state_str == "MERGED":
-                log(f"🎉 PR #{pr_num} was MERGED! Cleaning up branch '{branch}' and freeing slot.")
+                log(f"🎉 Upstream PR #{pr_num} was MERGED! Cleaning up branch '{branch}' and freeing slot.")
                 run_command(["git", "checkout", "main"], cwd=str(repo_path))
                 run_command(["git", "branch", "-D", branch], cwd=str(repo_path), check=False)
-                continue  # Exclude from updated_active_prs to free slot
+                continue  # Skip/remove from active pool
 
             # Condition B: Closed without merge
             if state_str == "CLOSED":
-                log(f"⚠️ PR #{pr_num} was CLOSED without merge. Cleaning up branch '{branch}' and freeing slot.")
+                log(f"⚠️ Upstream PR #{pr_num} was CLOSED. Cleaning up branch '{branch}' and freeing slot.")
                 run_command(["git", "checkout", "main"], cwd=str(repo_path))
                 run_command(["git", "branch", "-D", branch], cwd=str(repo_path), check=False)
-                continue  # Exclude to free slot
+                continue
 
-            # Condition C: Still Open - Check for new comments
-            all_comments = pr_data.get("comments", []) + get_inline_review_comments(repo_slug, pr_num)
+            # Condition C: Still Open -> Check for reviewer feedback
+            all_comments = pr_data.get("comments", []) + get_inline_review_comments(upstream_slug, pr_num)
             new_feedback = []
             for c in all_comments:
                 author = c.get("author", {}).get("login") or c.get("user", {}).get("login")
@@ -310,42 +313,44 @@ def run_shepherd_loop(
                     new_feedback.append(c)
 
             if new_feedback:
-                log(f"Found {len(new_feedback)} new feedback comment(s) on open PR #{pr_num}.")
-                handle_pr_feedback(repo_path, repo_slug, pr_data, new_feedback)
+                log(f"Found {len(new_feedback)} feedback comment(s) on upstream PR #{pr_num}.")
+                handle_pr_feedback(repo_path, upstream_slug, pr_data, new_feedback)
 
-            # Update last_checked timestamp and keep in pool
             pr_entry["last_checked_at"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
             updated_active_prs.append(pr_entry)
 
-        # 2. Refill pool up to max_prs
+        # 2. Check for approved proposal issues in your fork if pool has slots!
         available_slots = max_prs - len(updated_active_prs)
         if available_slots > 0:
-            log(f"Pool has {available_slots} available slot(s). Finding new high-priority task(s)...")
-            for _ in range(available_slots):
-                new_pr = create_new_pr_task(repo_path, repo_slug, updated_active_prs)
+            log(f"Pool has {available_slots} open slot(s). Checking {fork_slug}/issues for approved proposals...")
+            approved_issues = find_approved_proposals_in_fork(fork_slug, owner_user=current_user)
+            log(f"Found {len(approved_issues)} approved proposal issue(s).")
+
+            for issue in approved_issues[:available_slots]:
+                new_pr = process_approved_proposal(repo_path, upstream_slug, fork_slug, issue)
                 if new_pr:
                     updated_active_prs.append(new_pr)
-                else:
-                    break
 
         state["active_prs"] = updated_active_prs
         save_state(state)
 
-        log(f"Cycle finished. Active PRs: {[p['pr_number'] for p in updated_active_prs]}. Sleeping {poll_interval_seconds}s...")
+        log(f"Cycle complete. Active upstream PRs: {[p['pr_number'] for p in updated_active_prs]}. Sleeping {poll_interval_seconds}s...")
         time.sleep(poll_interval_seconds)
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Autonomous PR Shepherd Daemon.")
+    parser = argparse.ArgumentParser(description="Autonomous Shepherd with Fork Proposal Approvals.")
     parser.add_argument("--repo", default="/home/princer_google_com/c2dev/gcsfs", help="Path to local target repo")
-    parser.add_argument("--target-slug", default="fsspec/gcsfs", help="Target GitHub repo (owner/repo)")
-    parser.add_argument("--max-prs", type=int, default=3, help="Maximum concurrent open PRs (default: 3)")
+    parser.add_argument("--upstream", default="fsspec/gcsfs", help="Upstream repo (owner/repo)")
+    parser.add_argument("--fork", default="raj-prince/gcsfs", help="Fork repo (owner/repo)")
+    parser.add_argument("--max-prs", type=int, default=3, help="Max concurrent PRs (default: 3)")
     parser.add_argument("--poll-interval", type=int, default=1800, help="Poll interval in seconds (default: 1800)")
     args = parser.parse_args()
 
     run_shepherd_loop(
         target_repo_path=args.repo,
-        repo_slug=args.target_slug,
+        upstream_slug=args.upstream,
+        fork_slug=args.fork,
         max_prs=args.max_prs,
         poll_interval_seconds=args.poll_interval
     )
